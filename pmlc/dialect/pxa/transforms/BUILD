@@ -31,6 +31,7 @@ plaidml_cc_library(
         "stencil.cc",
         "test_analysis.cc",
         "tile.cc",
+	"subgroups.cc",
     ],
     hdrs = [
         "autotile.h",

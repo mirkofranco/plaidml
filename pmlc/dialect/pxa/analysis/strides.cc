@@ -84,8 +84,12 @@ void StrideRange::unionEquals(const StrideRange &rhs) {
 // Multiply the offset and all strides by a constant.
 StrideInfo &StrideInfo::operator*=(int64_t factor) {
   offset *= factor;
-  for (auto &kvp : strides) {
-    kvp.second *= factor;
+  if (factor == 0) {
+    strides.clear();
+  } else {
+    for (auto &kvp : strides) {
+      kvp.second *= factor;
+    }
   }
   return *this;
 }
@@ -95,6 +99,13 @@ StrideInfo &StrideInfo::operator+=(const StrideInfo &rhs) {
   offset += rhs.offset;
   for (const auto &kvp : rhs.strides) {
     strides[kvp.first] += kvp.second;
+  }
+  // Remove entries with 0 for stride
+  for (auto &kvp : llvm::make_early_inc_range(strides)) {
+    if (kvp.second == 0) {
+      // DenseMap never resizes during erase, so iterators stay valid.
+      strides.erase(kvp.first);
+    }
   }
   return *this;
 }
