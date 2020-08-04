@@ -11,6 +11,7 @@
 
 #include "mlir/Dialect/Affine/IR/AffineValueMap.h"
 #include "mlir/Support/DebugStringHelper.h"
+#include "pmlc/dialect/pxa/analysis/affine_expr.h"
 #include "pmlc/util/logging.h"
 #include "llvm/Support/FormatVariadic.h"
 
@@ -28,27 +29,44 @@ static std::string getUniqueName(Block *ref, BlockArgument arg) {
       .str();
 }
 
+// Generally useful helper function
+int64_t GetIVStep(BlockArgument arg) {
+  // Check the kind of loop we are part of, and dispatch.
+  Operation *baseOp = arg.getOwner()->getParentOp();
+
+  size_t idx = arg.getArgNumber();
+  if (auto op = dyn_cast<AffineParallelOp>(baseOp)) {
+    auto stepAttr = op.steps().getValue()[idx];
+    return stepAttr.cast<IntegerAttr>().getInt();
+  }
+  if (auto op = dyn_cast<AffineForOp>(baseOp)) {
+    return op.getStep();
+  }
+  llvm_unreachable("Get IV Step on non-IV");
+}
+
 StrideRange::StrideRange(BlockArgument arg)
     : valid(false), minVal(0), maxVal(0), stride(0) {
   if (auto ap =
           mlir::dyn_cast<AffineParallelOp>(arg.getOwner()->getParentOp())) {
-    auto low_expr = ap.getLowerBoundsValueMap().getResult(arg.getArgNumber());
-    auto high_expr = ap.getUpperBoundsValueMap().getResult(arg.getArgNumber());
-    auto low_cst = low_expr.dyn_cast<AffineConstantExpr>();
-    auto high_cst = high_expr.dyn_cast<AffineConstantExpr>();
-    if (!low_cst || !high_cst) {
+    auto range_expr = ap.getRangesValueMap().getResult(arg.getArgNumber());
+    auto range_cst = range_expr.dyn_cast<AffineConstantExpr>();
+    if (!range_cst) {
+      return;
+    }
+    int64_t range = range_cst.getValue();
+    if (range < 1) {
       return;
     }
     int64_t step = ap.steps()[arg.getArgNumber()].cast<IntegerAttr>().getInt();
-    if (step <= 0 || ((maxVal - minVal) % step) != 0) {
+    if (step <= 0) {
       return;
     }
     stride = 1;
-    minVal = low_cst.getValue();
+    minVal = 0;
     // This is a correction to deal with the fact that strides are measured
     // relative to loop iterations not indexes.
-    maxVal = low_cst.getValue() +
-             (high_cst.getValue() - low_cst.getValue()) / step - 1;
+    maxVal = (range - 1) / step;
     valid = true;
     if (minVal == maxVal) {
       stride = 0;
@@ -161,14 +179,60 @@ AffineExpr StrideInfo::toExpr(MLIRContext *ctx, ValueRange operands) const {
   }
   AffineExpr ret = getAffineConstantExpr(offset, ctx);
   for (const auto &kvp : strides) {
+    int64_t step = GetIVStep(kvp.first);
     auto it = opIdx.find(kvp.first);
     assert(it != opIdx.end() &&
            "toMap requires all values needed to be passed in as operands");
     ret = ret + getAffineDimExpr(it->second, ctx) *
-                    getAffineConstantExpr(kvp.second, ctx);
+                    getAffineConstantExpr(kvp.second / step, ctx);
   }
   return ret;
 }
+
+AffineValueExpr StrideInfo::toValueExpr(MLIRContext *ctx) const {
+  auto tot = AffineValueExpr(ctx, offset);
+  for (const auto &kvp : strides) {
+    Operation *baseOp = kvp.first.getOwner()->getParentOp();
+    AffineValueExpr idx(kvp.first);
+    if (auto op = dyn_cast<AffineParallelOp>(baseOp)) {
+      idx = idx - AffineValueExpr(op.getLowerBoundsValueMap(),
+                                  kvp.first.getArgNumber());
+    } else if (auto op = dyn_cast<AffineForOp>(baseOp)) {
+      auto map = op.getLowerBoundMap();
+      idx = idx - AffineValueExpr(map.getResult(0), op.getLowerBoundOperands());
+    } else {
+      llvm_unreachable("Invalid op type in toValueMap");
+    }
+    int64_t step = GetIVStep(kvp.first);
+    assert(kvp.second % step == 0 && "Stride not divisible by step");
+    tot = tot + idx * (kvp.second / step);
+  }
+  return tot;
+}
+
+/*&
+AffineValueMap StrideInfo::toValueMap() const {
+  // Make a set containing the union of all values required
+  DenseSet<Value> vals;
+  return nullptr;
+  // For each block arg in strides, get lower bound args and union
+
+  DenseMap<Value, unsigned> opIdx;
+  for (unsigned i = 0; i < operands.size(); i++) {
+    opIdx[operands[i]] = i;
+  }
+  AffineExpr ret = getAffineConstantExpr(offset, ctx);
+  for (const auto &kvp : strides) {
+    int64_t step = GetIVStep(kvp.first);
+    auto it = opIdx.find(kvp.first);
+    assert(it != opIdx.end() &&
+           "toMap requires all values needed to be passed in as operands");
+    ret = ret + getAffineDimExpr(it->second, ctx) *
+                    getAffineConstantExpr(kvp.second / step, ctx);
+  }
+  return ret;
+}
+  */
 
 void StrideInfo::print(raw_ostream &os, Block *relative) const {
   std::map<std::string, unsigned> ordered;
@@ -190,6 +254,14 @@ void StrideInfo::print(raw_ostream &os, Block *relative) const {
     os << item.value().first << "=" << item.value().second;
   }
   os << ']';
+}
+
+AffineValueMap StridesToValueMap(MLIRContext *ctx, ArrayRef<StrideInfo> dims) {
+  SmallVector<AffineValueExpr, 4> exprs;
+  for (const auto &si : dims) {
+    exprs.push_back(si.toValueExpr(ctx));
+  }
+  return jointValueMap(ctx, exprs);
 }
 
 static Optional<StrideInfo> computeStrideInfo(AffineParallelOp op,

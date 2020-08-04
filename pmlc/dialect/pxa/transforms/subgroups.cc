@@ -148,29 +148,6 @@ void TileAccumulations(AffineParallelOp op) {
   performTiling(op, accumTile);
 }
 
-Optional<int64_t> GetRange(StrideInfo si) {
-  int64_t max_val = 0;
-  for (const auto &kvp : si.strides) {
-    auto arg = kvp.first;
-    auto ap = mlir::dyn_cast<AffineParallelOp>(arg.getOwner()->getParentOp());
-    if (!ap) {
-      return None;
-    }
-    auto maybeRanges = ap.getConstantRanges();
-    if (!maybeRanges) {
-      return None;
-    }
-    int64_t base_range = (*maybeRanges)[arg.getArgNumber()];
-    int64_t step = ap.steps()[arg.getArgNumber()].cast<IntegerAttr>().getInt();
-    if (base_range % step != 0) {
-      return None;
-    }
-    int64_t trip_count = base_range / step;
-    max_val += kvp.second * (trip_count - 1);
-  }
-  return max_val + 1;
-}
-
 // Cache the load specified relative to the block specified
 LogicalResult CacheLoad(AffineParallelOp par, AffineLoadOp load) {
   auto maybeStrides =
@@ -182,17 +159,22 @@ LogicalResult CacheLoad(AffineParallelOp par, AffineLoadOp load) {
   const auto &strides = *maybeStrides;
 
   SmallVector<StrideInfo, 4> outer;
+  SmallVector<StrideInfo, 4> inner;
   SmallVector<int64_t, 4> innerSize;
   for (size_t i = 0; i < strides.size(); i++) {
     auto dimStride = strides[i];
-    auto dimStrideOuter = dimStride.outer(par.getBody());
-    auto dimStrideInner = dimStride.inner(par.getBody());
-    auto maybeInnerRange = GetRange(dimStrideInner);
-    if (!maybeInnerRange) {
+    outer.push_back(dimStride.outer(par.getBody()));
+    inner.push_back(dimStride.inner(par.getBody()));
+    auto rangeInner = inner[i].range();
+    if (!rangeInner.valid) {
       return failure();
     }
-    innerSize.push_back(*maybeInnerRange);
-    IVLOG(1, "Inner size = " << *maybeInnerRange);
+    if (rangeInner.stride != 1 && rangeInner.stride != 0) {
+      // TODO: Handle this case
+      return failure();
+    }
+    // inner.push_back(rangeInner);
+    innerSize.push_back(rangeInner.count());
   }
   IVLOG(1, "Passed point 2");
 
@@ -203,8 +185,29 @@ LogicalResult CacheLoad(AffineParallelOp par, AffineLoadOp load) {
   auto loadLoop = builder.create<AffineParallelOp>(
       loc, ArrayRef<Type>{type}, ArrayRef<AtomicRMWKind>{AtomicRMWKind::assign},
       innerSize);
+  SmallVector<StrideInfo, 4> globalStrides;
+  SmallVector<StrideInfo, 4> localStrides;
+  for (size_t i = 0; i < strides.size(); i++) {
+    auto offset = StrideInfo(loadLoop.getIVs()[i]);
+    globalStrides.push_back(outer[i] + offset);
+    localStrides.push_back(offset);
+  }
+  auto globalMap = StridesToValueMap(par.getContext(), globalStrides);
+  auto localMap = StridesToValueMap(par.getContext(), localStrides);
+  auto innerMap = StridesToValueMap(par.getContext(), inner);
   auto loadBuilder = loadLoop.getBodyBuilder();
-  loadBuilder.create<AffineYieldOp>(loc, ArrayRef<Value>{localBuf});
+  auto loaded = loadBuilder.create<AffineLoadOp>(
+      loc, load.getMemRef(), globalMap.getAffineMap(), globalMap.getOperands());
+  auto stored = loadBuilder.create<AffineReduceOp>(
+      loc, AggregationKind::assign, loaded, localBuf, localMap.getAffineMap(),
+      localMap.getOperands());
+  loadBuilder.create<AffineYieldOp>(loc, ArrayRef<Value>{stored});
+  OpBuilder newLoadBuilder(load);
+  auto newLoad = newLoadBuilder.create<AffineLoadOp>(
+      loc, localBuf, innerMap.getAffineMap(), innerMap.getOperands());
+  load.replaceAllUsesWith(newLoad.result());
+  load.erase();
+
   return success();
 }
 
