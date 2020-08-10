@@ -6,6 +6,7 @@ exports_files([
     "conda_wrapper.py",
     "version.tpl.cc",
     "version.tpl.py",
+    "googletest.LICENSE",
 ])
 
 config_setting(
