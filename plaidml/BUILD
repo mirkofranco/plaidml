@@ -176,7 +176,7 @@ string_flag(
 
 string_flag(
     name = "target",
-    values = ["llvm_cpu", "foo"],
+    values = ["llvm_cpu", "intel_gen"],
     build_setting_default = "llvm_cpu",
 )
 
